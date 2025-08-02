@@ -860,6 +860,29 @@ def log_activity(action, details=None):
             db.session.rollback()
 
 
+def generate_default_schedule_for_campaign(campaign_id):
+    """Generates a default 24/7 schedule for a campaign if none exists."""
+    existing_schedule = CampaignSchedule.query.filter_by(campaign_id=campaign_id).first()
+    if not existing_schedule:
+        logger.info(f"No existing schedule for campaign {campaign_id}, generating default 24/7 schedule.")
+        for day_of_week in range(7):  # 0 = Monday, 6 = Sunday
+            new_schedule = CampaignSchedule(
+                campaign_id=campaign_id,
+                day_of_week=day_of_week,
+                start_time=time(0, 0),
+                end_time=time(23, 59),
+                is_active=True
+            )
+            db.session.add(new_schedule)
+        try:
+            db.session.commit()
+            logger.info(f"Default 24/7 schedule generated for campaign {campaign_id}.")
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error generating default schedule for campaign {campaign_id}: {e}")
+            raise # Re-raise to ensure transaction rollback if part of a larger one
+
+
 # Authentication Routes
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1311,6 +1334,10 @@ def create_campaign():
         
         db.session.commit()
         
+        # Generate default schedule if campaign is active and no schedule exists
+        if campaign.status == 'active':
+            generate_default_schedule_for_campaign(campaign.id)
+        
         log_activity('campaign_created', f"Created campaign: {campaign.name}")
         logger.info(f"Created campaign: {campaign.name}")
         return jsonify(campaign.to_dict()), 201
@@ -1334,6 +1361,9 @@ def update_campaign(campaign_id):
             
         data = request.get_json()
         
+        # Store old status to check for changes
+        old_status = campaign.status
+
         # Update fields if provided
         if 'name' in data:
             campaign.name = data['name']
@@ -1343,24 +1373,25 @@ def update_campaign(campaign_id):
             campaign.status = data['status']
         if 'client_id' in data:
             campaign.client_id = data['client_id']
-        
-        # Handle dates
         if 'start_date' in data:
-            campaign.start_date = datetime.fromisoformat(data['start_date'].replace('Z', '+00:00')) if data['start_date'] else None
+            campaign.start_date = datetime.strptime(data['start_date'], '%Y-%m-%d').date()
         if 'end_date' in data:
-            campaign.end_date = datetime.fromisoformat(data['end_date'].replace('Z', '+00:00')) if data['end_date'] else None
-        
-        campaign.updated_at = datetime.utcnow()
+            campaign.end_date = datetime.strptime(data['end_date'], '%Y-%m-%d').date()
+
         db.session.commit()
-        
+
+        # Generate default schedule if status changed to 'active' and no schedule exists
+        if old_status != 'active' and campaign.status == 'active':
+            generate_default_schedule_for_campaign(campaign.id)
+
         log_activity('campaign_updated', f'Updated campaign: {campaign.name}')
-        logger.info(f"Updated campaign: {campaign.name}")
+        logger.info(f"Campaign '{campaign.name}' updated by {user.username}")
         return jsonify(campaign.to_dict())
-        
+
     except Exception as e:
-        logger.error(f"Error updating campaign {campaign_id}: {e}")
         db.session.rollback()
-        return jsonify({'error': 'Failed to update campaign'}), 500
+        logger.error(f"Error updating campaign {campaign_id}: {e}")
+        return jsonify({'error': 'Failed to update campaign', 'details': str(e)}), 500
 
 @app.route('/api/campaigns/<int:campaign_id>', methods=['DELETE'])
 @login_required
